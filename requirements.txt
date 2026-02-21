@@ -1,0 +1,16 @@
+pandas
+numpy
+scikit-learn
+sqlalchemy
+pymysql
+joblib
+pyyaml
+flask
+notebook
+python-dotenv
+streamlit
+<<<<<<< HEAD:requirement.txt
+altair==4.2.2
+=======
+altair==4.2.2
+>>>>>>> 8c0f02aef48cc05ae64be7248f36f0fd0802e5e1:requirements.txt
