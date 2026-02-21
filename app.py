@@ -1,36 +1,41 @@
-# app.py (updated: dropdowns for categorical features)
-import streamlit as st
+# flask_app.py - Main Flask Application
+from flask import Flask, render_template, request, jsonify, send_file
 import pandas as pd
 import joblib
 from pathlib import Path
 import json
-import numpy as np
+import io
 
-st.set_page_config(page_title="Laptop Price Predictor", layout="wide")
+app = Flask(__name__)
 
+# Paths configuration
 PROJECT_ROOT = Path.cwd()
 PREPROCESSOR_PATH = PROJECT_ROOT / "artifacts" / "transformed" / "preprocessor.joblib"
-MODEL_PATH = PROJECT_ROOT / "prediction" / "models" /"models" /"current_model.joblib"
+MODEL_PATH = PROJECT_ROOT / "prediction" / "models" / "models" / "current_model.joblib"
 FEATURE_LIST_PATH = PROJECT_ROOT / "artifacts" / "transformed" / "feature_list.json"
 TRAIN_CSV_PATH = PROJECT_ROOT / "artifacts" / "transformed" / "train.csv"
 
-st.title(" Laptop Price Prediction (Streamlit) — Dropdown Inputs")
-st.markdown(
-    "Use dropdowns for categorical fields (populated from training data) and number fields for numeric features. "
-    "This ensures the model receives correctly-typed input similar to training data."
-)
+# Global variables for loaded artifacts
+preprocessor = None
+model = None
+features = None
+num_cols = []
+cat_cols = []
+training_uniques = {}
 
-# --- helper functions ---
-@st.cache_resource
 def load_artifacts():
+    """Load model, preprocessor, and feature metadata"""
+    global preprocessor, model, features, num_cols, cat_cols
+    
     if not PREPROCESSOR_PATH.exists():
-        raise FileNotFoundError(f"Preprocessor not found at {PREPROCESSOR_PATH}. Run your training pipeline first.")
+        raise FileNotFoundError(f"Preprocessor not found at {PREPROCESSOR_PATH}")
     if not MODEL_PATH.exists():
-        raise FileNotFoundError(f"Model not found at {MODEL_PATH}. Run your training pipeline first.")
+        raise FileNotFoundError(f"Model not found at {MODEL_PATH}")
+    
     preprocessor = joblib.load(PREPROCESSOR_PATH)
     model = joblib.load(MODEL_PATH)
-
-    # load feature list if present
+    
+    # Load feature list
     if FEATURE_LIST_PATH.exists():
         with open(FEATURE_LIST_PATH, "r") as f:
             fl = json.load(f)
@@ -38,174 +43,178 @@ def load_artifacts():
         cat_cols = fl.get("cat_cols", [])
         features = num_cols + cat_cols
     else:
-        # fallback: try to infer from train csv if present
+        # Fallback: infer from train csv
         if TRAIN_CSV_PATH.exists():
             train_df = pd.read_csv(TRAIN_CSV_PATH)
             features = [c for c in train_df.columns.tolist() if c != "Price_INR"]
-            num_cols = train_df.select_dtypes(include=['int64','float64']).columns.tolist()
+            num_cols = train_df.select_dtypes(include=['int64', 'float64']).columns.tolist()
             num_cols = [c for c in num_cols if c in features]
             cat_cols = [c for c in features if c not in num_cols]
         else:
-            features = None
+            features = []
             num_cols = []
             cat_cols = []
-    return preprocessor, model, features, num_cols, cat_cols
+    
+    return True
 
-@st.cache_data
 def load_training_unique_values():
-    """Returns dict: {col: sorted_unique_values} using train.csv (for dropdowns)."""
-    result = {}
+    """Load unique values from training data for dropdowns"""
+    global training_uniques
+    
     if TRAIN_CSV_PATH.exists():
         df = pd.read_csv(TRAIN_CSV_PATH)
-        # For each categorical feature, return unique sorted values (as strings)
         for col in df.columns:
             if col == "Price_INR":
                 continue
             if pd.api.types.is_numeric_dtype(df[col].dtype):
                 continue
+            
             uniques = df[col].dropna().unique().tolist()
-            # convert to strings and sort by frequency then alphabetically for UX
             try:
                 freq = df[col].value_counts().to_dict()
-                uniques_sorted = sorted(uniques, key=lambda x: (-freq.get(x,0), str(x)))
+                uniques_sorted = sorted(uniques, key=lambda x: (-freq.get(x, 0), str(x)))
             except Exception:
                 uniques_sorted = sorted([str(u) for u in uniques])
-            result[col] = [str(u) for u in uniques_sorted]
-    return result
+            
+            training_uniques[col] = [str(u) for u in uniques_sorted]
+    
+    return training_uniques
 
-def predict_df(df_input, preprocessor, model):
-    """Take DataFrame of features (no Price_INR) and return DataFrame with predictions."""
+def get_numeric_defaults():
+    """Get default values for numeric fields"""
+    defaults = {}
+    if TRAIN_CSV_PATH.exists():
+        df = pd.read_csv(TRAIN_CSV_PATH)
+        for col in num_cols:
+            if col in df.columns:
+                defaults[col] = {
+                    'median': float(df[col].median()),
+                    'is_int': pd.api.types.is_integer_dtype(df[col].dtype)
+                }
+    return defaults
+
+def predict_single(input_data):
+    """Make prediction for single input"""
+    df = pd.DataFrame([input_data], columns=features)
+    X_t = preprocessor.transform(df)
+    pred = model.predict(X_t)
+    return float(pred[0])
+
+def predict_batch(df_input):
+    """Make predictions for batch input"""
     df = df_input.copy()
     if "Price_INR" in df.columns:
         df = df.drop(columns=["Price_INR"])
-    X = df.copy()
-    # Ensure columns order matches training feature list if available
-    # Preprocessor will expect the same set of columns passed during training
-    try:
-        X_t = preprocessor.transform(X)
-    except Exception as e:
-        raise RuntimeError(f"Preprocessor transform failed: {e}")
+    
+    X_t = preprocessor.transform(df)
     preds = model.predict(X_t)
-    out = df.copy()
-    out["predicted_Price_INR"] = preds
-    return out
+    df["Predicted_Price_INR"] = preds
+    return df
 
-def to_csv_bytes(df):
-    return df.to_csv(index=False).encode("utf-8")
-
-# --- load artifacts ---
+# Initialize artifacts on startup
 try:
-    preprocessor, model, features, num_cols, cat_cols = load_artifacts()
-    st.success("Loaded model and preprocessor.")
+    load_artifacts()
+    load_training_unique_values()
+    print("✓ Model and artifacts loaded successfully")
 except Exception as e:
-    st.error(f"Error loading artifacts: {e}")
-    st.stop()
+    print(f"✗ Error loading artifacts: {e}")
 
-# load training uniques for dropdowns
-training_uniques = load_training_unique_values()
+@app.route('/')
+def home():
+    """Render home page"""
+    numeric_defaults = get_numeric_defaults()
+    return render_template('index.html', 
+                         features=features,
+                         num_cols=num_cols,
+                         cat_cols=cat_cols,
+                         training_uniques=training_uniques,
+                         numeric_defaults=numeric_defaults)
 
-# Sidebar info
-with st.sidebar:
-    st.header("Options")
-    st.write("Model path:")
-    st.text(str(MODEL_PATH))
-    st.write("Preprocessor path:")
-    st.text(str(PREPROCESSOR_PATH))
-    st.write("---")
-    st.write("If dropdowns are empty, ensure artifacts/transformed/train.csv exists.")
-    if features:
-        st.write("Expected features:")
-        st.text(", ".join(features))
-
-# If we have feature list, build a dropdown form
-st.subheader("1) Predict single record (dropdown-based)")
-
-if features is None:
-    st.warning("Feature list not available. Use batch CSV upload (below) or run training pipeline to generate feature_list.json.")
-else:
-    with st.form("single_form"):
-        input_vals = {}
-        # We'll create two columns layout to keep UI compact
-        col_left, col_right = st.columns(2)
-        # numeric inputs on left, categorical dropdowns on right (for readability)
-        for c in features:
-            if c in num_cols:
-                # detect int vs float
-                sample_type = "float"
-                # try to infer integer by reading train.csv dtype if available
-                if TRAIN_CSV_PATH.exists():
-                    df_train = pd.read_csv(TRAIN_CSV_PATH, usecols=[c])
-                    if pd.api.types.is_integer_dtype(df_train[c].dtype):
-                        sample_type = "int"
-                if sample_type == "int":
-                    default_val = int(df_train[c].median()) if TRAIN_CSV_PATH.exists() else 0
-                    val = col_left.number_input(f"{c}", value=default_val, step=1, format="%d", key=f"num_{c}")
-                else:
-                    default_val = float(df_train[c].median()) if TRAIN_CSV_PATH.exists() else 0.0
-                    val = col_left.number_input(f"{c}", value=float(default_val), step=1.0, key=f"num_{c}")
-                input_vals[c] = val
-            else:
-                # categorical -> dropdown populated from training uniques if present
-                options = training_uniques.get(c, [])
-                if options:
-                    # add a clear placeholder
-                    sel = col_right.selectbox(f"{c}", options=["-- select --"] + options, index=0, key=f"cat_{c}")
-                    # enforce selection: keep empty string if not selected
-                    input_vals[c] = "" if sel == "-- select --" else sel
-                else:
-                    # If no unique values found, fallback to text_input (but user asked dropdowns)
-                    # We'll still provide a text_input so the form is usable
-                    val = col_right.text_input(f"{c} (free text)", value="", key=f"cat_free_{c}")
-                    input_vals[c] = val
-
-        submitted = st.form_submit_button("Predict single record")
-
-    if submitted:
-        # Validate that all categorical dropdowns have non-empty selection (if options existed)
-        missing = []
-        for c in features:
-            if c not in num_cols:
-                opts = training_uniques.get(c, [])
-                if opts and (input_vals.get(c, "") == "" or input_vals.get(c) == "-- select --"):
-                    missing.append(c)
-        if missing:
-            st.error(f"Please select values for: {', '.join(missing)}")
-        else:
-            single_df = pd.DataFrame([input_vals], columns=features)
-            try:
-                out = predict_df(single_df, preprocessor, model)
-                st.write("Prediction result:")
-                st.table(out)
-                st.download_button("Download result CSV", data=to_csv_bytes(out), file_name="single_prediction.csv")
-            except Exception as e:
-                st.error(f"Prediction failed: {e}")
-
-st.markdown("---")
-
-# --- batch upload (unchanged) ---
-st.subheader("2) Batch prediction — upload CSV")
-uploaded_file = st.file_uploader("Upload CSV (no Price_INR column)", type=["csv"])
-if uploaded_file is not None:
+@app.route('/predict', methods=['POST'])
+def predict():
+    """Handle single prediction request"""
     try:
-        df_in = pd.read_csv(uploaded_file)
+        input_data = {}
+        
+        # Extract form data
+        for feature in features:
+            value = request.form.get(feature)
+            
+            if feature in num_cols:
+                # Convert to appropriate numeric type
+                if TRAIN_CSV_PATH.exists():
+                    df = pd.read_csv(TRAIN_CSV_PATH, usecols=[feature])
+                    if pd.api.types.is_integer_dtype(df[feature].dtype):
+                        input_data[feature] = int(float(value))
+                    else:
+                        input_data[feature] = float(value)
+                else:
+                    input_data[feature] = float(value)
+            else:
+                # Categorical
+                input_data[feature] = str(value)
+        
+        # Make prediction
+        prediction = predict_single(input_data)
+        
+        return jsonify({
+            'success': True,
+            'prediction': round(prediction, 2),
+            'input_data': input_data
+        })
+    
     except Exception as e:
-        st.error(f"Failed to read CSV: {e}")
-        df_in = None
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 400
 
-    if df_in is not None:
-        st.write("Preview of uploaded data:")
-        st.dataframe(df_in.head())
+@app.route('/batch_predict', methods=['POST'])
+def batch_predict():
+    """Handle batch prediction from CSV upload"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({'success': False, 'error': 'No file uploaded'}), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'success': False, 'error': 'No file selected'}), 400
+        
+        # Read CSV
+        df_input = pd.read_csv(file)
+        
+        # Make predictions
+        df_output = predict_batch(df_input)
+        
+        # Convert to CSV for download
+        output = io.StringIO()
+        df_output.to_csv(output, index=False)
+        output.seek(0)
+        
+        return send_file(
+            io.BytesIO(output.getvalue().encode()),
+            mimetype='text/csv',
+            as_attachment=True,
+            download_name='predictions.csv'
+        )
+    
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 400
 
-        st.write("Run prediction on uploaded file:")
-        if st.button("Run batch predictions"):
-            try:
-                out_df = predict_df(df_in, preprocessor, model)
-                st.success("Prediction finished.")
-                st.dataframe(out_df.head())
-                st.download_button("Download predictions (CSV)", data=to_csv_bytes(out_df), file_name="batch_predictions.csv")
-            except Exception as e:
-                st.error(f"Batch prediction failed: {e}")
+@app.route('/health')
+def health():
+    """Health check endpoint for Render"""
+    return jsonify({
+        'status': 'healthy',
+        'model_loaded': model is not None,
+        'preprocessor_loaded': preprocessor is not None,
+        'features_count': len(features) if features else 0
+    })
 
-st.markdown("---")
-st.info("If transform fails due to column mismatch, open artifacts/transformed/feature_list.json and ensure uploaded CSV columns match exactly (names and types).")
-st.caption("Streamlit app by your E2E pipeline")
+if __name__ == '__main__':
+    # For local development
+    app.run(debug=True, host='0.0.0.0', port=5000)
+
